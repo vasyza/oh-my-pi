@@ -14,6 +14,7 @@ import * as fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import { $ } from "bun";
+import { ensureCmakeConfigureShim } from "../../../scripts/cmake-shim";
 import { detectHostAvx2Support, resolveLocalHostAddon } from "../../../scripts/host-detect";
 import { generateEnumExports } from "./gen-enums";
 
@@ -52,6 +53,14 @@ if (process.platform === "win32" && (!Bun.which("cmake") || !Bun.which("ninja"))
 			process.env.PATH = [process.env.PATH ?? "", ...extraDirs].filter(Boolean).join(path.delimiter);
 		}
 	}
+}
+// Vendored-sys cmake configure shim (scripts/cmake-shim.ts): appends
+// -DCMAKE_INSTALL_LIBDIR=lib so audiopus_sys' hardcoded {out}/lib link search
+// matches GNUInstallDirs output on lib64 Linux hosts. No-op wherever
+// pkg-config already satisfies the sys crate or on Windows.
+const cmakeShimDir = ensureCmakeConfigureShim();
+if (cmakeShimDir) {
+	process.env.PATH = [cmakeShimDir, process.env.PATH ?? ""].filter(Boolean).join(path.delimiter);
 }
 
 const repoRoot = path.join(import.meta.dir, "../../..");

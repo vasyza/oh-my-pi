@@ -114,7 +114,7 @@ describe("STTController preflight", () => {
 		const download = vi.spyOn(downloader, "downloadSttModel").mockReturnValue(new Promise<void>(() => {}));
 
 		const editor = makeEditor();
-		controller = new STTController(() => ({ stop: vi.fn() }));
+		controller = new STTController({ createCapture: () => ({ stop: vi.fn() }) });
 		const options = makeOptions();
 		await controller.toggle(editor, options);
 
@@ -142,7 +142,7 @@ describe("STTController preflight", () => {
 		});
 
 		const editor = makeEditor();
-		controller = new STTController(() => ({ stop: vi.fn() }));
+		controller = new STTController({ createCapture: () => ({ stop: vi.fn() }) });
 		const options = makeOptions();
 		await controller.toggle(editor, options);
 
@@ -159,7 +159,7 @@ describe("STTController preflight", () => {
 		vi.spyOn(downloader, "downloadSttModel").mockReturnValue(new Promise<void>(() => {}));
 
 		const editor = makeEditor();
-		controller = new STTController(() => ({ stop: vi.fn() }));
+		controller = new STTController({ createCapture: () => ({ stop: vi.fn() }) });
 		await controller.toggle(editor, makeOptions());
 		expect(controller.state).toBe("recording");
 		expect(isCached).toHaveBeenLastCalledWith("fast");
@@ -181,9 +181,11 @@ describe("STTController preflight", () => {
 		const stopCapture = vi.fn();
 		const editor = makeEditor();
 		const options = makeOptions();
-		controller = new STTController(callback => {
-			onAudio = callback;
-			return { stop: stopCapture };
+		controller = new STTController({
+			createCapture: (_sampleRate, callback) => {
+				onAudio = callback;
+				return { stop: stopCapture };
+			},
 		});
 		await controller.toggle(editor, options);
 

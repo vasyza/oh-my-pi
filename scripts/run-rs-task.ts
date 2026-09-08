@@ -2,6 +2,7 @@
 
 import * as path from "node:path";
 import { $ } from "bun";
+import { ensureCmakeConfigureShim } from "./cmake-shim";
 
 const RUST_AFFECTING_FILE_NAMES = [
 	"Cargo.toml",
@@ -174,6 +175,8 @@ async function runCommand(command: readonly string[]): Promise<number> {
 		const pathSep = process.platform === "win32" ? ";" : ":";
 		const currentPath = env.PATH ?? env.Path ?? "";
 		env.PATH = currentPath === "" ? toolchainBin : `${toolchainBin}${pathSep}${currentPath}`;
+		const cmakeShimDir = ensureCmakeConfigureShim();
+		if (cmakeShimDir) env.PATH = `${cmakeShimDir}${pathSep}${env.PATH}`;
 	}
 	const proc = Bun.spawn(argv, {
 		cwd: repoRoot,

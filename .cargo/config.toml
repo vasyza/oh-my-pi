@@ -9,16 +9,31 @@
 # annotation in MODULE.bazel); mirror it here so the cargo path works too.
 [env]
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
-# The Makefile generator can wedge cargo forever on macOS: the `cmake` crate
-# forwards cargo's jobserver via MAKEFLAGS, and Xcode's GNU make 3.81 blocks
-# reading a jobserver pipe whose write end doesn't survive `cmake -E env`
-# (observed in omp with whisper-rs-sys; audiopus_sys uses the same crate).
-# Ninja schedules itself and ignores make's jobserver protocol entirely.
-# The GitHub-hosted Windows ARM64 release runner and nix builds already carry
-# ninja. Other CI workspace Rust compiles via Bazel (which ignores this file,
-# opus pinned in MODULE.bazel). Dev hosts need ninja (nix dev-shell provides
-# it; macOS: `brew install ninja`).
-CMAKE_GENERATOR = "Ninja"
+# CMake generator selection.
+#
+# CMake's own default already prefers Ninja whenever it is on PATH, so every
+# supported dev host (nix dev-shell, macOS with `brew install ninja`, Windows
+# runners carrying ninja) keeps building with Ninja with no setting here.
+# Forcing `CMAKE_GENERATOR = "Ninja"` additionally hard-fails minimal Linux
+# containers that have make but no ninja, where the Unix Makefiles fallback
+# works fine — so the default is deliberately left alone. Do NOT re-add the
+# force; macOS hosts without ninja should install it instead, because the
+# Makefile generator can wedge cargo forever there: the `cmake` crate forwards
+# cargo's jobserver via MAKEFLAGS, and Xcode's GNU make 3.81 blocks reading a
+# jobserver pipe whose write end doesn't survive `cmake -E env` (observed in
+# omp with whisper-rs-sys; audiopus_sys uses the same crate). The repo's cargo
+# entry points (`packages/natives/scripts/build-bindings.ts`,
+# `scripts/run-rs-task.ts`) warn loudly in that configuration.
+#
+# Library install dir (NOT settable here): audiopus_sys 0.2.2 hardcodes
+# `rustc-link-search={out}/lib`, but its CMakeLists uses GNUInstallDirs, which
+# installs to `lib64` on 64-bit Linux. `CMAKE_INSTALL_LIBDIR` as an
+# environment variable does not seed the CMake cache (verified), and the sys
+# crate accepts no defines, so the repo's cargo entry points prepend a
+# `cmake` configure shim (scripts/cmake-shim.ts) that appends
+# `-DCMAKE_INSTALL_LIBDIR=lib` to configure runs. Bare `cargo` invocations on
+# Linux without a pkg-config-visible static opus still hit the lib64 mismatch;
+# use the repo scripts instead.
 # Store each crate's metadata only in its .rmeta instead of duplicating it into
 # every rlib. Measured on a reqwest-sized graph: 196 MB -> 130 MB target dir at
 # identical build times. Requires the pinned nightly (rust-toolchain.toml).

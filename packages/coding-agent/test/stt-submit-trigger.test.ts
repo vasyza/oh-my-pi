@@ -197,7 +197,7 @@ describe("STTController submit trigger integration", () => {
 		});
 		const editor = makeEditor();
 		const options = makeOptions();
-		controller = new STTController(() => ({ stop: vi.fn() }));
+		controller = new STTController({ createCapture: () => ({ stop: vi.fn() }) });
 
 		await controller.toggle(editor, options);
 		expect(controller.state).toBe("recording");

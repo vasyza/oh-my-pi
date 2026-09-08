@@ -35,9 +35,9 @@ export interface SttDownloadResult {
 	error?: string;
 }
 
-/** Live streaming session handle returned by {@link SttClient.startStream}. */
+/** Live streaming session handle returned by {@link SttClient.startStream} or a cloud dictation transport. */
 export interface SttStreamHandle {
-	/** Feed 16 kHz mono float samples as the recorder produces them. */
+	/** Feed mono float samples at the backend-negotiated rate (local/xAI 16 kHz, Codex 24 kHz). */
 	pushAudio(audio: Float32Array): void;
 	/** Flush the trailing segment and resolve with the full joined transcript. */
 	stop(): Promise<string>;

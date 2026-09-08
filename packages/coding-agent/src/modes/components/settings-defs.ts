@@ -154,6 +154,13 @@ const CONDITIONS: Record<string, () => boolean> = {
 			return false;
 		}
 	},
+	localSttActive: () => {
+		try {
+			return Settings.instance.get("stt.provider") === "local";
+		} catch {
+			return false;
+		}
+	},
 };
 
 // ═══════════════════════════════════════════════════════════════════════════

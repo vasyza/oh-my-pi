@@ -2484,6 +2484,31 @@ export const SETTINGS_SCHEMA = {
 			description: "Enable speech-to-text input via microphone",
 		},
 	},
+	"stt.provider": {
+		type: "enum",
+		values: ["local", "xai", "openai-codex"] as const,
+		default: "local",
+		ui: {
+			tab: "interaction",
+			group: "Speech",
+			label: "Speech-to-Text Provider",
+			description:
+				"Dictation backend. Local runs on-device; xAI Grok and OpenAI Codex send microphone audio to the connected provider account for transcription.",
+			options: [
+				{ value: "local", label: "Local", description: "On-device speech model below; audio stays local" },
+				{
+					value: "xai",
+					label: "xAI Grok",
+					description: "Requires xAI Grok OAuth or XAI_API_KEY; streams audio to xAI",
+				},
+				{
+					value: "openai-codex",
+					label: "OpenAI Codex",
+					description: "Requires OpenAI Codex OAuth; streams audio to OpenAI with batch fallback",
+				},
+			],
+		},
+	},
 
 	"stt.language": {
 		type: "string",
@@ -2501,6 +2526,7 @@ export const SETTINGS_SCHEMA = {
 			description:
 				"Local on-device speech model. Parakeet TDT v3 (sherpa-onnx) is the SoTA default; Whisper base/small/large-v3-turbo tiers (transformers.js) trade size for multilingual coverage. Downloaded on first use.",
 			options: STT_MODEL_OPTIONS,
+			condition: "localSttActive",
 		},
 	},
 	"stt.submitTrigger": {
@@ -6346,12 +6372,12 @@ export interface ThinkingBudgetsSettings {
 	xhigh: number;
 	max: number;
 }
-
 export interface SttSettings {
 	enabled: boolean;
+	provider: SettingValue<"stt.provider">;
 	language: string | undefined;
 	modelName: string;
-	streaming: boolean;
+	submitTrigger: SettingValue<"stt.submitTrigger">;
 }
 
 export interface BashInterceptorRule {

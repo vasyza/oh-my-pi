@@ -1,7 +1,8 @@
 import { AudioCapture } from "@oh-my-pi/pi-natives";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { settings } from "../config/settings";
 import { type SttStreamHandle, sttClient } from "./asr-client";
+import { type CloudSttContext, type CloudSttProvider, parseCloudSttProvider, startCloudSttStream } from "./cloud";
 import { downloadSttModel, isSttModelCached } from "./downloader";
 import { resolveSttModelSpec } from "./models";
 import { evaluateSubmitTrigger } from "./submit-trigger";
@@ -30,9 +31,37 @@ interface CaptureHandle {
 	stop(): void;
 }
 
-type CaptureFactory = (onAudio: (error: Error | null, samples: Float32Array) => void) => CaptureHandle;
+type CaptureFactory = (
+	sampleRate: number,
+	onAudio: (error: Error | null, samples: Float32Array) => void,
+) => CaptureHandle;
 
-/** Coordinates native microphone capture with incremental local transcription. */
+export interface STTControllerOptions {
+	/**
+	 * Resolve the cloud auth context for the current session. Called once per
+	 * recording so focus/session switches never stick to a stale session id.
+	 * Absent in local-only SDK/test use: selecting a cloud provider without a
+	 * resolver is an explicit error, never a silent local fallback.
+	 */
+	cloud?: () => CloudSttContext;
+	createCapture?: CaptureFactory;
+}
+
+const LOCAL_SAMPLE_RATE = 16_000;
+const XAI_SAMPLE_RATE = 16_000;
+const CODEX_SAMPLE_RATE = 24_000;
+const WARNING_BODY_LIMIT = 2_048;
+
+function cleanCloudText(text: string): string {
+	return sanitizeText(text.replaceAll("\t", " ")).replace(/\s+/g, " ").trim();
+}
+
+function cleanWarning(message: string): string {
+	const cleaned = sanitizeText(message.replaceAll("\t", " ")).trim();
+	return cleaned.length > WARNING_BODY_LIMIT ? `${cleaned.slice(0, WARNING_BODY_LIMIT)}…` : cleaned;
+}
+
+/** Coordinates microphone capture with local or provider transcription. */
 export class STTController {
 	#state: SttState = "idle";
 	#resolvedModelKey: string | null = null;
@@ -40,6 +69,7 @@ export class STTController {
 	#stopAfterStart = false;
 	#disposed = false;
 	readonly #createCapture: CaptureFactory;
+	readonly #resolveCloud: (() => CloudSttContext) | undefined;
 
 	// Live streaming capture.
 	#stream: SttStreamHandle | null = null;
@@ -48,10 +78,15 @@ export class STTController {
 	#streamCommitted = false;
 	#streamAbort: AbortController | null = null;
 	#streamUtterance = "";
+	#streamCloud = false;
+	#cloudPreview = "";
+	#cloudProvider: CloudSttProvider | null = null;
+	#generation = 0;
 
 	/** Creates a controller; tests may replace the hardware capture boundary. */
-	constructor(createCapture: CaptureFactory = onAudio => new AudioCapture(16_000, onAudio)) {
-		this.#createCapture = createCapture;
+	constructor(options: STTControllerOptions = {}) {
+		this.#resolveCloud = options.cloud;
+		this.#createCapture = options.createCapture ?? ((sampleRate, onAudio) => new AudioCapture(sampleRate, onAudio));
 	}
 
 	get state(): SttState {
@@ -145,9 +180,28 @@ export class STTController {
 		});
 	}
 
+	#readProvider(): string {
+		try {
+			const value = settings.get("stt.provider");
+			return typeof value === "string" ? value : "local";
+		} catch {
+			return "local";
+		}
+	}
+
 	async #start(editor: Editor, options: ToggleOptions): Promise<void> {
-		if (!(await this.#ensureDeps(options))) return;
-		await this.#startStreaming(editor, options);
+		const providerValue = this.#readProvider();
+		if (providerValue === "local") {
+			if (!(await this.#ensureDeps(options))) return;
+			await this.#startStreaming(editor, options);
+			return;
+		}
+		const provider = parseCloudSttProvider(providerValue);
+		if (!provider) {
+			options.showWarning(`Unknown speech provider: ${providerValue}`);
+			return;
+		}
+		await this.#startCloud(editor, provider, options);
 	}
 
 	async #stop(options: ToggleOptions): Promise<void> {
@@ -170,17 +224,20 @@ export class STTController {
 		this.#streamEditor = editor;
 		this.#streamCommitted = false;
 		this.#streamUtterance = "";
+		this.#streamCloud = false;
+		this.#cloudProvider = null;
 		this.#streamAbort = new AbortController();
+		const generation = ++this.#generation;
 		const stream = sttClient.startStream(modelKey, {
 			language: language || undefined,
 			signal: this.#streamAbort.signal,
 			onPartial: text => {
-				if (this.#disposed || this.#state !== "recording") return;
+				if (this.#disposed || this.#stream !== stream || this.#state !== "recording") return;
 				this.#streamEditor?.setVolatileText(this.#prefixed(text));
 				options.requestRender?.();
 			},
 			onSegment: text => {
-				if (this.#disposed) return;
+				if (this.#disposed || this.#generation !== generation) return;
 				const prefixed = this.#prefixed(text);
 				if (prefixed) {
 					this.#streamEditor?.commitVolatileText(prefixed);
@@ -195,30 +252,9 @@ export class STTController {
 		this.#stream = stream;
 		let recorder: CaptureHandle;
 		try {
-			recorder = this.#createCapture((error, samples) => {
-				if (this.#disposed || this.#stream !== stream || this.#state !== "recording") return;
-				if (error) {
-					logger.error("Native microphone capture failed", { error: error.message });
-					const activeRecorder = this.#streamRecorder;
-					this.#streamRecorder = null;
-					try {
-						activeRecorder?.stop();
-					} catch (cause) {
-						logger.debug("stt: microphone cleanup failed", {
-							error: cause instanceof Error ? cause.message : String(cause),
-						});
-					}
-					this.#streamAbort?.abort(error);
-					stream.cancel();
-					this.#streamEditor?.clearVolatileText();
-					options.requestRender?.();
-					this.#cleanupStream();
-					this.#setState("idle", options);
-					options.showWarning(error.message);
-					return;
-				}
-				stream.pushAudio(samples);
-			});
+			recorder = this.#createCapture(LOCAL_SAMPLE_RATE, (error, samples) =>
+				this.#handleCaptureAudio(generation, stream, options, error, samples),
+			);
 		} catch (err) {
 			stream.cancel();
 			this.#cleanupStream();
@@ -232,6 +268,125 @@ export class STTController {
 		logger.debug("STT live recording started", { modelKey });
 	}
 
+	async #startCloud(editor: Editor, provider: CloudSttProvider, options: ToggleOptions): Promise<void> {
+		if (!this.#resolveCloud) {
+			options.showWarning("Cloud speech-to-text needs a session context and is unavailable here.");
+			return;
+		}
+		let context: CloudSttContext;
+		try {
+			context = this.#resolveCloud();
+		} catch (err) {
+			options.showWarning(cleanWarning(err instanceof Error ? err.message : "Failed to resolve speech context"));
+			return;
+		}
+		const language = settings.get("stt.language") as string | undefined;
+		const abort = new AbortController();
+		this.#streamAbort = abort;
+		const generation = ++this.#generation;
+		let stream: SttStreamHandle;
+		try {
+			stream = await startCloudSttStream(context, provider, {
+				language: language || undefined,
+				signal: abort.signal,
+				onPartial: text => {
+					if (this.#disposed || this.#generation !== generation || this.#stream !== stream) return;
+					// Cloud previews are whole-dictation replacements valid while the
+					// final flush is still pending; local segment commits never run here.
+					if (this.#state !== "recording" && this.#state !== "transcribing") return;
+					this.#cloudPreview = cleanCloudText(text);
+					this.#streamEditor?.setVolatileText(this.#cloudPreview);
+					options.requestRender?.();
+				},
+				onError: () => {
+					if (this.#disposed || this.#generation !== generation || this.#stream !== stream) return;
+					// Recorded only: the stop path surfaces the failure once via the
+					// stream rejection, keeping a single warning for the recording.
+					logger.debug("stt: cloud stream error", { provider });
+				},
+				onStatus: message => {
+					if (this.#disposed || this.#generation !== generation || this.#stream !== stream) return;
+					options.showStatus(message);
+				},
+			});
+		} catch (err) {
+			this.#streamAbort = null;
+			if (abort.signal.aborted || this.#disposed) return;
+			const msg = cleanWarning(err instanceof Error ? err.message : "Failed to start cloud speech-to-text");
+			options.showWarning(msg);
+			logger.error("STT cloud preflight failed", { provider });
+			return;
+		}
+		if (this.#disposed || this.#generation !== generation || abort.signal.aborted || this.#stopAfterStart) {
+			abort.abort();
+			stream.cancel();
+			this.#streamAbort = null;
+			return;
+		}
+		this.#stream = stream;
+		this.#streamEditor = editor;
+		this.#streamCommitted = false;
+		this.#streamUtterance = "";
+		this.#streamCloud = true;
+		this.#cloudProvider = provider;
+		this.#cloudPreview = "";
+		const sampleRate = provider === "openai-codex" ? CODEX_SAMPLE_RATE : XAI_SAMPLE_RATE;
+		let recorder: CaptureHandle;
+		try {
+			recorder = this.#createCapture(sampleRate, (error, samples) =>
+				this.#handleCaptureAudio(generation, stream, options, error, samples),
+			);
+		} catch (err) {
+			stream.cancel();
+			this.#cleanupStream();
+			const msg = err instanceof Error ? err.message : "Failed to start microphone capture";
+			options.showWarning(msg);
+			logger.error("STT recording failed to start", { error: msg });
+			return;
+		}
+		this.#streamRecorder = recorder;
+		this.#setState("recording", options);
+		logger.debug("STT cloud recording started", { provider });
+	}
+
+	#handleCaptureAudio(
+		generation: number,
+		stream: SttStreamHandle,
+		options: ToggleOptions,
+		error: Error | null,
+		samples: Float32Array,
+	): void {
+		if (this.#disposed || this.#generation !== generation || this.#stream !== stream) return;
+		if (this.#state !== "recording") return;
+		if (error) {
+			logger.error("Native microphone capture failed", { error: error.message });
+			const activeRecorder = this.#streamRecorder;
+			this.#streamRecorder = null;
+			try {
+				activeRecorder?.stop();
+			} catch (cause) {
+				logger.debug("stt: microphone cleanup failed", {
+					error: cause instanceof Error ? cause.message : String(cause),
+				});
+			}
+			this.#streamAbort?.abort(error);
+			stream.cancel();
+			this.#streamEditor?.clearVolatileText();
+			options.requestRender?.();
+			this.#cleanupStream();
+			this.#setState("idle", options);
+			options.showWarning(error.message);
+			return;
+		}
+		try {
+			stream.pushAudio(samples);
+		} catch (err) {
+			logger.debug("stt: audio push failed", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
 	async #stopStreaming(options: ToggleOptions): Promise<void> {
 		const stream = this.#stream;
 		const recorder = this.#streamRecorder;
@@ -239,6 +394,7 @@ export class STTController {
 			this.#setState("idle", options);
 			return;
 		}
+		const cloud = this.#streamCloud;
 		this.#setState("transcribing", options);
 		// Stop the mic first so no further audio is fed, then flush the worker.
 		try {
@@ -257,17 +413,32 @@ export class STTController {
 		} catch (err) {
 			failed = true;
 			if (!this.#disposed) {
-				const msg = err instanceof Error ? err.message : "Transcription failed";
+				const msg = cleanWarning(err instanceof Error ? err.message : "Transcription failed");
 				options.showWarning(msg);
-				logger.error("STT live transcription failed", { error: msg });
+				logger.error("STT live transcription failed", {
+					provider: this.#cloudProvider ?? "local",
+				});
 			}
 		}
 		if (this.#disposed) {
 			this.#cleanupStream();
 			return;
 		}
+		if (failed) {
+			// Keep the last cloud preview as an editable draft; local failures
+			// leave whatever the worker committed. Never auto-submit an error.
+			if (cloud && this.#cloudPreview) {
+				this.#streamEditor?.commitVolatileText(this.#cloudPreview);
+			} else {
+				this.#streamEditor?.clearVolatileText();
+			}
+			options.requestRender?.();
+			this.#cleanupStream();
+			this.#setState("idle", options);
+			return;
+		}
 		if (!this.#streamCommitted && finalText) {
-			const prefixed = this.#prefixed(finalText);
+			const prefixed = cloud ? cleanCloudText(finalText) : this.#prefixed(finalText);
 			this.#streamEditor?.commitVolatileText(prefixed);
 			this.#streamCommitted = true;
 			this.#streamUtterance = prefixed;
@@ -299,10 +470,14 @@ export class STTController {
 		this.#streamCommitted = false;
 		this.#streamAbort = null;
 		this.#streamUtterance = "";
+		this.#streamCloud = false;
+		this.#cloudProvider = null;
+		this.#cloudPreview = "";
 	}
 
 	dispose(): void {
 		this.#disposed = true;
+		this.#generation += 1;
 		if (this.#streamAbort) {
 			this.#streamAbort.abort();
 			this.#streamAbort = null;
