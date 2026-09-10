@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Fixed Wayland computer-use clicks landing in the wrong place on scaled monitors by mapping captures through the portal's logical monitor geometry ([#11540](https://github.com/can1357/oh-my-pi/issues/11540)).
+
+## [18.1.15] - 2026-09-08
+
+### Fixed
+
 - Fixed C++ language inference excluding CUDA header (`.cuh`) files ([#10782](https://github.com/can1357/oh-my-pi/pull/10782) by [@alphastorm](https://github.com/alphastorm)).
 
 ## [18.1.9] - 2026-09-04
