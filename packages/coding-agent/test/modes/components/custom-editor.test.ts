@@ -15,6 +15,8 @@ import {
 	SPACE_HOLD_MECHANICAL_RUN,
 	SPACE_HOLD_RELEASE_MS,
 	SPACE_REPEAT_MAX_GAP_MS,
+	SPACE_TAP_COUNT,
+	SPACE_TAP_GAP_MS,
 } from "../../../src/modes/components/custom-editor";
 import { getEditorTheme, initTheme, theme } from "../../../src/modes/theme/theme";
 
@@ -53,6 +55,14 @@ function feedGaps(editor: CustomEditor, gaps: number[]): void {
 		vi.advanceTimersByTime(gapMs);
 		editor.handleInput(" ");
 	}
+}
+
+/** Feed `count` deliberate taps with human jitter. Perfectly even gaps are *not* a tap gesture:
+ *  OS key-repeat stays metronomic at any rate, so the latch refuses them (`SPACE_TAP_METRONOME_MS`). */
+function feedTaps(editor: CustomEditor, count: number): void {
+	const gaps: number[] = [];
+	for (let i = 0; i < count; i++) gaps.push(i % 2 === 0 ? TAP_GAP_MS : TAP_GAP_MS + 60);
+	feedGaps(editor, gaps);
 }
 
 async function decorateInFreshProcess(text: string, imageLinks?: readonly string[]): Promise<string> {
@@ -588,5 +598,196 @@ describe("CustomEditor space-hold push-to-talk", () => {
 		feedSpaces(editor, 8, REPEAT_GAP_MS);
 		expect(editor.getText()).toBe(" ".repeat(8));
 		expect(events).toEqual([]);
+	});
+});
+
+describe("CustomEditor latched hands-free gesture", () => {
+	beforeAll(async () => {
+		await initTheme();
+	});
+
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	/** Editor wired for both space gestures; `handsFree` flips the latch-owns-the-mic gate. */
+	function makeGestureEditor() {
+		const editor = new CustomEditor(getEditorTheme());
+		const events: string[] = [];
+		const tapCounts: number[] = [];
+		let handsFree = false;
+		editor.sttHoldEnabled = () => true;
+		editor.onSpaceHoldStart = () => events.push("start");
+		editor.onSpaceHoldEnd = () => events.push("end");
+		editor.onSpaceTapToggle = taps => {
+			tapCounts.push(taps);
+			events.push("tap");
+		};
+		editor.handsFreeActive = () => handsFree;
+		return {
+			editor,
+			events,
+			tapCounts,
+			setHandsFree(value: boolean) {
+				handsFree = value;
+			},
+		};
+	}
+
+	it("latches on a three-tap burst and leaves no spaces in the composer", () => {
+		const { editor, events, tapCounts } = makeGestureEditor();
+		editor.handleInput("hi");
+		feedTaps(editor, SPACE_TAP_COUNT);
+		// The transcript belongs to the dictation, not to three typed spaces.
+		expect(editor.getText()).toBe("hi");
+		expect(tapCounts).toEqual([SPACE_TAP_COUNT]);
+		// Push-to-talk never fired: this is the latch, not a hold.
+		expect(events).toEqual(["tap"]);
+	});
+
+	it("keeps typing the double-space-after-a-period habit instead of latching", () => {
+		const { editor, tapCounts } = makeGestureEditor();
+		// Two taps then prose: the burst is over and both spaces stay.
+		feedTaps(editor, 2);
+		editor.handleInput("x");
+		expect(editor.getText()).toBe("  x");
+		expect(tapCounts).toEqual([]);
+	});
+
+	it("does not latch when the taps are spread beyond the gesture window", () => {
+		const { editor, tapCounts } = makeGestureEditor();
+		feedGaps(editor, [SPACE_TAP_GAP_MS + 100, SPACE_TAP_GAP_MS + 100, SPACE_TAP_GAP_MS + 100]);
+		expect(editor.getText()).toBe("   ");
+		expect(tapCounts).toEqual([]);
+	});
+
+	it("swallows the taps past the burst so a longer burst toggles the latch only once", () => {
+		const { editor, tapCounts } = makeGestureEditor();
+		feedTaps(editor, SPACE_TAP_COUNT + 3);
+		expect(tapCounts).toEqual([SPACE_TAP_COUNT]);
+		expect(editor.getText()).toBe("");
+	});
+
+	it("still recognizes a held bar as push-to-talk, not as taps", () => {
+		const { editor, events, tapCounts } = makeGestureEditor();
+		feedSpaces(editor, SPACE_HOLD_MECHANICAL_RUN + 2, REPEAT_GAP_MS);
+		expect(events).toEqual(["start"]);
+		expect(tapCounts).toEqual([]);
+	});
+
+	it("types spaces instead of starting push-to-talk while the latch owns the mic", () => {
+		const { editor, events, tapCounts, setHandsFree } = makeGestureEditor();
+		setHandsFree(true);
+		// A held bar during dictation must not cut the session off mid-sentence.
+		feedSpaces(editor, 5, REPEAT_GAP_MS);
+		expect(events).toEqual([]);
+		expect(editor.getText()).toBe(" ".repeat(5));
+
+		// Two taps must not toggle prematurely or delete earlier held spaces.
+		feedTaps(editor, 2);
+		expect(tapCounts).toEqual([]);
+		expect(editor.getText()).toBe(" ".repeat(7));
+
+		// The third tap toggles the latch and rolls back only the 3 burst taps.
+		feedTaps(editor, 1);
+		expect(tapCounts).toEqual([SPACE_TAP_COUNT]);
+		expect(editor.getText()).toBe(" ".repeat(5));
+	});
+
+	it("rolls back only the spaces the burst typed", () => {
+		const { editor, tapCounts } = makeGestureEditor();
+		// The pinned smash cadence types every one of these spaces; the burst that follows must take
+		// back its own taps and nothing else.
+		const smashed = [40, 95, 45, 100, 35, 90, 50, 105];
+		feedGaps(editor, smashed);
+		feedTaps(editor, SPACE_TAP_COUNT);
+		expect(editor.getText()).toBe(" ".repeat(smashed.length));
+		expect(tapCounts).toEqual([SPACE_TAP_COUNT]);
+	});
+
+	it("never deletes text a paste put between the taps", () => {
+		const { editor, tapCounts } = makeGestureEditor();
+		editor.handleInput("hi");
+		feedTaps(editor, 2);
+		// A paste lands mid-burst: the roll-back may only take the burst's own space.
+		editor.handleInput(bracketedPaste("world"));
+		feedTaps(editor, 1);
+		expect(tapCounts).toEqual([SPACE_TAP_COUNT]);
+		expect(editor.getText()).toBe("hi  world");
+	});
+
+	it("never deletes whitespace a paste put between the taps", () => {
+		const { editor, tapCounts } = makeGestureEditor();
+		editor.handleInput("hi");
+		feedTaps(editor, 2);
+		// The pasted payload ends in spaces of its own: counting trailing spaces would delete them.
+		editor.handleInput(bracketedPaste("world  "));
+		feedTaps(editor, 1);
+		expect(tapCounts).toEqual([SPACE_TAP_COUNT]);
+		expect(editor.getText()).toBe("hi  world  ");
+	});
+
+	it("never deletes whitespace a paste put between earlier taps in the burst", () => {
+		const { editor, tapCounts } = makeGestureEditor();
+		editor.handleInput("hi");
+		feedGaps(editor, [TAP_GAP_MS]);
+		// An intervening paste with trailing whitespace lands between Tap 1 and Tap 2:
+		editor.handleInput(bracketedPaste("world  "));
+		feedGaps(editor, [TAP_GAP_MS + 60, TAP_GAP_MS]);
+		expect(tapCounts).toEqual([SPACE_TAP_COUNT]);
+		expect(editor.getText()).toBe("hi world  ");
+	});
+
+	it("rolls back tapped spaces on an earlier line in multiline text", () => {
+		const { editor, tapCounts } = makeGestureEditor();
+		editor.setText("line 1\nline 2");
+		editor.moveToMessageStart();
+		editor.moveToLineEnd();
+		expect(editor.getCursor()).toEqual({ line: 0, col: 6 });
+
+		feedTaps(editor, SPACE_TAP_COUNT);
+		expect(tapCounts).toEqual([SPACE_TAP_COUNT]);
+		expect(editor.getText()).toBe("line 1\nline 2");
+	});
+
+	it("toggles the latch back off with a later burst, past the swallow window", () => {
+		const { editor, tapCounts } = makeGestureEditor();
+		feedTaps(editor, SPACE_TAP_COUNT);
+		expect(tapCounts).toEqual([SPACE_TAP_COUNT]);
+
+		// Taps that continue the burst that just fired are swallowed: no second toggle...
+		feedTaps(editor, SPACE_TAP_COUNT);
+		expect(tapCounts).toEqual([SPACE_TAP_COUNT]);
+
+		// ...and once the window has passed, the next burst belongs to the latch's off switch.
+		vi.advanceTimersByTime(SPACE_TAP_GAP_MS + 1);
+		feedTaps(editor, SPACE_TAP_COUNT);
+		expect(tapCounts).toEqual([SPACE_TAP_COUNT, SPACE_TAP_COUNT]);
+	});
+
+	it("holds the burst open on an exactly-window gap and resets one millisecond past it", () => {
+		const exact = makeGestureEditor();
+		// Both gaps sit on the window edge and still vary like a human's would.
+		feedGaps(exact.editor, [SPACE_TAP_GAP_MS, SPACE_TAP_GAP_MS - 60, SPACE_TAP_GAP_MS - 20]);
+		expect(exact.tapCounts).toEqual([SPACE_TAP_COUNT]);
+
+		const past = makeGestureEditor();
+		feedGaps(past.editor, [SPACE_TAP_GAP_MS + 1, SPACE_TAP_GAP_MS + 1, SPACE_TAP_GAP_MS + 1]);
+		expect(past.editor.getText()).toBe("   ");
+		expect(past.tapCounts).toEqual([]);
+	});
+
+	it("refuses a metronomic burst inside the tap band as a slow held bar, not taps", () => {
+		const { editor, events, tapCounts } = makeGestureEditor();
+		// A slow OS key-repeat rate looks exactly like this: several spaces, same gap every time.
+		// Holding the bar must keep typing (the pre-gesture behavior) instead of latching.
+		feedGaps(editor, [200, 201, 199, 200, 202, 198]);
+		expect(tapCounts).toEqual([]);
+		expect(events).toEqual([]);
+		expect(editor.getText()).toBe(" ".repeat(6));
 	});
 });

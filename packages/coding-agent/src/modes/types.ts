@@ -26,6 +26,7 @@ import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext } from "../session/session-context";
 import type { SessionManager } from "../session/session-manager";
 import type { ShakeMode } from "../session/shake-types";
+import type { SttTrigger } from "../stt";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import type { LspStartupServerInfo } from "../tools";
 import type { EventBus } from "../utils/event-bus";
@@ -426,7 +427,12 @@ export interface InteractiveModeContext {
 	handleWorktreeCommand(branch?: string): Promise<void>;
 	handleRenameCommand(title: string): Promise<void>;
 	handleMemoryCommand(text: string): Promise<void>;
-	handleSTTToggle(): Promise<void>;
+	/** Push-to-talk toggle (`trigger` defaults to the hold gesture). */
+	handleSTTToggle(trigger?: SttTrigger): Promise<void>;
+	/** Latched hands-free dictation toggle: recording survives the trigger's release. */
+	handleSTTHandsFreeToggle(): Promise<void>;
+	/** True while a latched hands-free recording owns the microphone. */
+	isSttHandsFreeActive(): boolean;
 	/** Start or stop the Codex-backed realtime voice session. */
 	handleLiveCommand(): Promise<void>;
 	executeCompaction(

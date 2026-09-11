@@ -9,7 +9,19 @@ import { evaluateSubmitTrigger } from "./submit-trigger";
 
 export type SttState = "idle" | "recording" | "transcribing";
 
+/**
+ * What asked for the current state change. `"hold"` is push-to-talk (the space
+ * bar / any hold gesture): a release stops recordings it started, and it never
+ * touches a latched session. `"handsFree"` is the latched toggle (a key like
+ * Ctrl+Space or the triple-tap burst): it starts a session that survives key
+ * release and stops it on the next trigger. Push-to-talk never stops a latched
+ * recording — the user may be mid-thought with the terminal unfocused — and the
+ * latch never hijacks an active hold recording.
+ */
+export type SttTrigger = "hold" | "handsFree";
+
 interface ToggleOptions {
+	trigger?: SttTrigger;
 	showWarning(msg: string): void;
 	showStatus(msg: string): void;
 	onStateChange(state: SttState): void;
@@ -66,7 +78,12 @@ export class STTController {
 	#state: SttState = "idle";
 	#resolvedModelKey: string | null = null;
 	#toggling = false;
-	#stopAfterStart = false;
+	/** Trigger whose stop request arrived while the start was still in flight; applied once the
+	 *  start finishes so a hold release can never cancel a latched start (and vice versa). */
+	#stopAfterStart: SttTrigger | null = null;
+	/** Which trigger owns the session currently recording (or being started). Set on
+	 *  start, cleared on cleanup; a release only stops a session its own trigger started. */
+	#trigger: SttTrigger | null = null;
 	#disposed = false;
 	readonly #createCapture: CaptureFactory;
 	readonly #resolveCloud: (() => CloudSttContext) | undefined;
@@ -99,16 +116,39 @@ export class STTController {
 	}
 
 	async toggle(editor: Editor, options: ToggleOptions): Promise<void> {
+		const trigger = options.trigger ?? "hold";
 		if (this.#toggling) {
-			if (this.#state === "idle" || this.#state === "recording") this.#stopAfterStart = true;
+			// A stop that arrives while the start is still awaiting its preflight: remember which
+			// trigger asked, so a hold release can never cancel a latched start (and vice versa).
+			// Only the trigger that owns the in-flight session may arm it — a press from the other
+			// trigger is ignored here exactly as the ownership gate below ignores it for a live
+			// session, and it must never overwrite a stop the owner already asked for.
+			if (
+				(this.#state === "idle" || this.#state === "recording") &&
+				(this.#trigger === null || this.#trigger === trigger)
+			) {
+				this.#stopAfterStart = trigger;
+			}
 			return;
 		}
+		// While one trigger owns the session, only that trigger may end it. A
+		// push-to-talk release must not cut off a hands-free dictation the user is
+		// still speaking into (they may have alt-tabbed away), and a stray hold must
+		// not stop a latched recording either.
+		if (this.#trigger !== null && this.#trigger !== trigger) return;
 		this.#toggling = true;
 		try {
 			switch (this.#state) {
-				case "idle":
+				case "idle": {
+					this.#trigger = trigger;
 					await this.#start(editor, options);
+					// Every successful start ends in `recording`; a preflight or microphone
+					// failure leaves the state idle with the mic unclaimed, so drop ownership
+					// instead of locking out the other trigger for the rest of the session.
+					const settled = this.state;
+					if (settled !== "recording") this.#trigger = null;
 					break;
+				}
 				case "recording":
 					await this.#stop(options);
 					break;
@@ -116,15 +156,21 @@ export class STTController {
 					options.showStatus("Transcription in progress...");
 					break;
 			}
-			if (this.#stopAfterStart && this.#state === "recording") {
-				this.#stopAfterStart = false;
+			if (this.#stopAfterStart === trigger && this.#state === "recording") {
 				await this.#stop(options);
-			} else if (this.#state !== "recording") {
-				this.#stopAfterStart = false;
 			}
+			// Whether or not it applied, the slot is spent: a stop tagged for the other trigger can
+			// never end this session, and leaving it set would arm the *next* toggle of that trigger
+			// to stop itself the moment it starts.
+			this.#stopAfterStart = null;
 		} finally {
 			this.#toggling = false;
 		}
+	}
+
+	/** True while a latched (hands-free) session owns the microphone. */
+	get handsFreeActive(): boolean {
+		return this.#trigger === "handsFree";
 	}
 
 	async #ensureDeps(options: ToggleOptions): Promise<boolean> {
@@ -219,6 +265,10 @@ export class STTController {
 	}
 
 	async #startStreaming(editor: Editor, options: ToggleOptions): Promise<void> {
+		// `dispose()` can land while the preflight above was awaiting (a first-run model download);
+		// bail before opening a stream and the microphone that nothing would then stop, so the state
+		// stays idle and the caller drops ownership.
+		if (this.#disposed) return;
 		const modelKey = resolveSttModelSpec(settings.get("stt.modelName") as string | undefined).key;
 		const language = settings.get("stt.language") as string | undefined;
 		this.#streamEditor = editor;
@@ -317,7 +367,14 @@ export class STTController {
 			logger.error("STT cloud preflight failed", { provider });
 			return;
 		}
-		if (this.#disposed || this.#generation !== generation || abort.signal.aborted || this.#stopAfterStart) {
+		if (
+			this.#disposed ||
+			this.#generation !== generation ||
+			abort.signal.aborted ||
+			// Only a stop from the trigger that owns this start cancels it: a hold release (or a latch
+			// press) arriving while the other trigger's start is in flight must not kill the session.
+			this.#stopAfterStart === this.#trigger
+		) {
 			abort.abort();
 			stream.cancel();
 			this.#streamAbort = null;
@@ -473,6 +530,8 @@ export class STTController {
 		this.#streamCloud = false;
 		this.#cloudProvider = null;
 		this.#cloudPreview = "";
+		// The session is over: whoever started it no longer owns the microphone.
+		this.#trigger = null;
 	}
 
 	dispose(): void {

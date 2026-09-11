@@ -55,6 +55,7 @@ interface AppKeybindings {
 	"app.plan.toggle": true;
 	"app.history.search": true;
 	"app.stt.toggle": true;
+	"app.stt.handsFree": true;
 	"app.live.toggle": true;
 }
 
@@ -233,6 +234,13 @@ export const KEYBINDINGS = {
 	"app.stt.toggle": {
 		defaultKeys: [],
 		description: "Toggle speech-to-text (default gesture: hold Space)",
+	},
+	"app.stt.handsFree": {
+		// Ctrl+Space is the shipped IME input-source toggle on macOS and on Linux/Windows CJK IME
+		// setups, which consume the chord before the terminal sees it; Ctrl+Shift+Space is not
+		// claimed by those or by any other default here, so the latch stays reachable there.
+		defaultKeys: ["ctrl+space", "ctrl+shift+space"],
+		description: "Toggle hands-free dictation (latched; default gesture: triple-tap Space)",
 	},
 	"app.live.toggle": {
 		defaultKeys: "ctrl+l",

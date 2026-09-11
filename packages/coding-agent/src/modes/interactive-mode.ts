@@ -117,7 +117,7 @@ import type { SessionManager } from "../session/session-manager";
 import type { ShakeMode } from "../session/shake-types";
 import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, buildTuiBuiltinSlashCommands } from "../slash-commands/builtin-registry";
 import { formatDuration } from "../slash-commands/helpers/format";
-import { STTController, type SttState } from "../stt";
+import { STTController, type SttState, type SttTrigger } from "../stt";
 import { resolveCliEntryCmd } from "../subprocess/worker-client";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
 import { labelEchoesHandle } from "../task/label";
@@ -5871,29 +5871,49 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#commandController.handleMemoryCommand(text);
 	}
 
-	async handleSTTToggle(): Promise<void> {
+	async handleSTTToggle(trigger: SttTrigger = "hold"): Promise<void> {
 		if (this.#liveCommandController.active) {
-			this.showWarning("End live mode before using push-to-talk speech input.");
+			this.showWarning("End live mode before using speech input.");
 			return;
 		}
-		if (!settings.get("stt.enabled")) {
+		// The setting gates *starting* dictation; a session that is already live must stay stoppable,
+		// or turning `stt.enabled` off mid-recording would leave the microphone open with no way to
+		// end it (the gesture paths are gated on the same setting).
+		if (!settings.get("stt.enabled") && !this.isSttHandsFreeActive()) {
 			this.showWarning("Speech-to-text is disabled. Enable it in settings: stt.enabled");
 			return;
 		}
-		if (!this.#sttController) {
-			this.#sttController = new STTController({
+		await this.#sttToggle(trigger);
+	}
+
+	/** Latched hands-free dictation, started or stopped by a key gesture. Recording runs until
+	 *  stopped explicitly, so the user can leave the terminal and keep talking. */
+	async handleSTTHandsFreeToggle(): Promise<void> {
+		await this.handleSTTToggle("handsFree");
+	}
+
+	isSttHandsFreeActive(): boolean {
+		return this.#sttController?.handsFreeActive ?? false;
+	}
+
+	async #sttToggle(trigger: SttTrigger): Promise<void> {
+		let controller = this.#sttController;
+		if (!controller) {
+			controller = new STTController({
 				cloud: () => ({
 					modelRegistry: this.viewSession.modelRegistry,
 					sessionId: this.viewSession.sessionId,
 				}),
 			});
+			this.#sttController = controller;
 		}
-		await this.#sttController.toggle(this.editor, {
+		await controller.toggle(this.editor, {
+			trigger,
 			showWarning: (msg: string) => this.showWarning(msg),
 			showStatus: (msg: string) => this.showStatus(msg),
 			requestRender: () => this.ui.requestRender(),
 			onStateChange: (state: SttState) => {
-				// Duck assistant speech while the user is talking (push-to-talk); restore after.
+				// Duck assistant speech while the user is talking; restore after.
 				if (state === "recording") vocalizer.duck();
 				else vocalizer.unduck();
 				if (state === "recording") {

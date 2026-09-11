@@ -196,4 +196,144 @@ describe("STTController preflight", () => {
 		expect(editor.clearVolatileText).toHaveBeenCalledTimes(1);
 		expect(options.showWarning).toHaveBeenCalledWith("Microphone permission denied");
 	});
+
+	it("keeps a latched recording alive when the push-to-talk gesture releases", async () => {
+		vi.spyOn(downloader, "isSttModelCached").mockResolvedValue(true);
+		vi.spyOn(downloader, "downloadSttModel").mockReturnValue(new Promise<void>(() => {}));
+		const editor = makeEditor();
+		const options = makeOptions();
+		controller = new STTController({ createCapture: () => ({ stop: vi.fn() }) });
+
+		await controller.toggle(editor, { ...options, trigger: "handsFree" });
+		expect(controller.state).toBe("recording");
+		expect(controller.handsFreeActive).toBe(true);
+
+		// The space bar's release — the push-to-talk stop — must not cut off the dictation the user
+		// is still speaking into with the terminal unfocused.
+		await controller.toggle(editor, { ...options, trigger: "hold" });
+		expect(controller.state).toBe("recording");
+		expect(controller.handsFreeActive).toBe(true);
+
+		// The latch's own trigger ends it.
+		await controller.toggle(editor, { ...options, trigger: "handsFree" });
+		expect(controller.state).toBe("idle");
+		expect(controller.handsFreeActive).toBe(false);
+	});
+
+	it("does not let the latch take over an active push-to-talk recording", async () => {
+		vi.spyOn(downloader, "isSttModelCached").mockResolvedValue(true);
+		vi.spyOn(downloader, "downloadSttModel").mockReturnValue(new Promise<void>(() => {}));
+		const editor = makeEditor();
+		const options = makeOptions();
+		controller = new STTController({ createCapture: () => ({ stop: vi.fn() }) });
+
+		await controller.toggle(editor, { ...options, trigger: "hold" });
+		expect(controller.state).toBe("recording");
+		expect(controller.handsFreeActive).toBe(false);
+
+		// A latch press while the bar is still held leaves the hold session alone...
+		await controller.toggle(editor, { ...options, trigger: "handsFree" });
+		expect(controller.state).toBe("recording");
+		expect(controller.handsFreeActive).toBe(false);
+
+		// ...and the hold's own release still ends it.
+		await controller.toggle(editor, { ...options, trigger: "hold" });
+		expect(controller.state).toBe("idle");
+	});
+
+	it("keeps the latch alive when the hold trigger fires during its start", async () => {
+		const preflight = Promise.withResolvers<boolean>();
+		vi.spyOn(downloader, "isSttModelCached").mockReturnValue(preflight.promise);
+		vi.spyOn(downloader, "downloadSttModel").mockReturnValue(new Promise<void>(() => {}));
+		const editor = makeEditor();
+		const options = makeOptions();
+		controller = new STTController({ createCapture: () => ({ stop: vi.fn() }) });
+
+		// The latch's start is in flight (first-run preflight) when the bar's release arrives: it must
+		// not cancel the session the user just asked for.
+		const starting = controller.toggle(editor, { ...options, trigger: "handsFree" });
+		await controller.toggle(editor, { ...options, trigger: "hold" });
+		preflight.resolve(true);
+		await starting;
+
+		expect(controller.state).toBe("recording");
+		expect(controller.handsFreeActive).toBe(true);
+	});
+
+	it("honours the owner's release when the other trigger presses mid-start", async () => {
+		const preflight = Promise.withResolvers<boolean>();
+		vi.spyOn(downloader, "isSttModelCached").mockReturnValue(preflight.promise);
+		vi.spyOn(downloader, "downloadSttModel").mockReturnValue(new Promise<void>(() => {}));
+		const editor = makeEditor();
+		const options = makeOptions();
+		controller = new STTController({ createCapture: () => ({ stop: vi.fn() }) });
+
+		// The bar goes down (start in flight), comes up (the release), and only then does the latch
+		// key arrive: the release belongs to the session being started and must still end it.
+		const starting = controller.toggle(editor, { ...options, trigger: "hold" });
+		await controller.toggle(editor, { ...options, trigger: "hold" });
+		await controller.toggle(editor, { ...options, trigger: "handsFree" });
+		preflight.resolve(true);
+		await starting;
+
+		expect(controller.state).toBe("idle");
+		expect(controller.handsFreeActive).toBe(false);
+	});
+
+	it("does not leak a mid-start stop into the next session", async () => {
+		const preflight = Promise.withResolvers<boolean>();
+		vi.spyOn(downloader, "isSttModelCached").mockReturnValue(preflight.promise);
+		vi.spyOn(downloader, "downloadSttModel").mockReturnValue(new Promise<void>(() => {}));
+		let onAudio: ((error: Error | null, samples: Float32Array) => void) | undefined;
+		const editor = makeEditor();
+		const options = makeOptions();
+		controller = new STTController({
+			createCapture: (_sampleRate, callback) => {
+				onAudio = callback;
+				return { stop: vi.fn() };
+			},
+		});
+
+		// A hold start in flight, then the latch key: that stop request belongs to the hold session
+		// that never started, so it must not be kept for the next latch.
+		const starting = controller.toggle(editor, { ...options, trigger: "hold" });
+		await controller.toggle(editor, { ...options, trigger: "handsFree" });
+		preflight.resolve(true);
+		await starting;
+		expect(controller.state).toBe("recording");
+
+		// The microphone dies mid-session, ending it without going through toggle().
+		onAudio?.(new Error("Microphone permission denied"), new Float32Array());
+		expect(controller.state).toBe("idle");
+
+		// A latch started now must record instead of stopping itself the moment it starts.
+		await controller.toggle(editor, { ...options, trigger: "handsFree" });
+		expect(controller.state).toBe("recording");
+		expect(controller.handsFreeActive).toBe(true);
+	});
+
+	it("drops latch ownership when its start fails so push-to-talk still works", async () => {
+		vi.spyOn(downloader, "isSttModelCached").mockResolvedValue(true);
+		vi.spyOn(downloader, "downloadSttModel").mockReturnValue(new Promise<void>(() => {}));
+		const editor = makeEditor();
+		const options = makeOptions();
+		let microphoneAvailable = false;
+		controller = new STTController({
+			createCapture: () => {
+				if (!microphoneAvailable) throw new Error("No microphone");
+				return { stop: vi.fn() };
+			},
+		});
+
+		await controller.toggle(editor, { ...options, trigger: "handsFree" });
+		expect(controller.state).toBe("idle");
+		expect(controller.handsFreeActive).toBe(false);
+		expect(options.showWarning).toHaveBeenCalledWith("No microphone");
+
+		// The failed latch must not lock the hold trigger out of the microphone.
+		microphoneAvailable = true;
+		await controller.toggle(editor, { ...options, trigger: "hold" });
+		expect(controller.state).toBe("recording");
+		expect(controller.handsFreeActive).toBe(false);
+	});
 });

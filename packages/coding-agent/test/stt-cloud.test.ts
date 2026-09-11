@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import type { ModelRegistry } from "../src/config/model-registry";
 import { Settings, settings } from "../src/config/settings";
 import * as asrClient from "../src/stt/asr-client";
@@ -163,7 +163,15 @@ describe("STTController cloud backends", () => {
 		vi.restoreAllMocks();
 	});
 
-	function trackCapture() {
+	interface CloudCaptureHarness {
+		factory: (rate: number, callback: (error: Error | null, samples: Float32Array) => void) => { stop: () => void };
+		rates: number[];
+		stop: Mock<() => void>;
+		feed: (samples: Float32Array) => void;
+		fail: (error: Error) => void;
+	}
+
+	function trackCapture(): CloudCaptureHarness {
 		let onAudio: ((error: Error | null, samples: Float32Array) => void) | undefined;
 		const rates: number[] = [];
 		const stop = vi.fn();
@@ -436,5 +444,101 @@ describe("STTController cloud backends", () => {
 		expect(capture.stop).toHaveBeenCalledTimes(1);
 		expect(editor.clearVolatileText).toHaveBeenCalled();
 		expect(options.showWarning).toHaveBeenCalledWith("Microphone permission denied");
+	});
+
+	/** A cloud start parked in credential resolution, with the release valve in the test's hand. */
+	function gatedXaiController(url: string, capture: CloudCaptureHarness) {
+		let releaseKey: ((key: string | undefined) => void) | undefined;
+		const gate = new Promise<string | undefined>(resolve => {
+			releaseKey = resolve;
+		});
+		const controller = new STTController({
+			cloud: () => ({
+				modelRegistry: {
+					...fakeXaiRegistry(url, "k"),
+					getApiKeyForProvider: () => gate,
+				} as unknown as ModelRegistry,
+				sessionId: "s",
+			}),
+			createCapture: capture.factory,
+		});
+		return { controller, release: (key: string | undefined) => releaseKey?.(key) };
+	}
+
+	it("does not let the hold trigger cancel a latched cloud start in flight", async () => {
+		const { server, url } = startXaiDictation(ws => {
+			ws.send(JSON.stringify({ type: "transcript.done", text: "latched" }));
+		});
+		servers.push(server);
+		settings.set("stt.provider", "xai");
+		const capture = trackCapture();
+		const gated = gatedXaiController(url, capture);
+		controller = gated.controller;
+		const editor = makeEditor();
+		const options = makeOptions();
+
+		// The latch's start is parked; the push-to-talk release arrives while it is in flight and must
+		// not cancel the session the user just asked for.
+		const starting = gated.controller.toggle(editor, { ...options, trigger: "handsFree" });
+		await gated.controller.toggle(editor, { ...options, trigger: "hold" });
+		gated.release("k");
+		await starting;
+
+		expect(controller.state).toBe("recording");
+		expect(controller.handsFreeActive).toBe(true);
+		expect(capture.rates).toHaveLength(1);
+	});
+
+	it("cancels a cloud start when its own trigger asks to stop in flight", async () => {
+		const { server, url } = startXaiDictation(ws => {
+			ws.send(JSON.stringify({ type: "transcript.done", text: "never" }));
+		});
+		servers.push(server);
+		settings.set("stt.provider", "xai");
+		const capture = trackCapture();
+		const gated = gatedXaiController(url, capture);
+		controller = gated.controller;
+		const editor = makeEditor();
+		const options = makeOptions();
+
+		const starting = gated.controller.toggle(editor, { ...options, trigger: "handsFree" });
+		await gated.controller.toggle(editor, { ...options, trigger: "handsFree" });
+		gated.release("k");
+		await starting;
+
+		// The stop the owner asked for wins: no microphone, no session, and the slot is spent so the
+		// next latch records instead of stopping itself.
+		expect(capture.rates).toHaveLength(0);
+		expect(controller.state).toBe("idle");
+		expect(controller.handsFreeActive).toBe(false);
+	});
+
+	it("drops ownership when the cloud start itself fails", async () => {
+		settings.set("stt.provider", "xai");
+		const capture = trackCapture();
+		const editor = makeEditor();
+		const options = makeOptions();
+		controller = new STTController({
+			cloud: () => ({
+				modelRegistry: {
+					...fakeXaiRegistry("http://127.0.0.1:1", undefined),
+					getApiKeyForProvider: async () => {
+						throw new Error("xAI credentials unavailable");
+					},
+				} as unknown as ModelRegistry,
+				sessionId: "s",
+			}),
+			createCapture: capture.factory,
+		});
+
+		await controller.toggle(editor, { ...options, trigger: "handsFree" });
+
+		expect(controller.state).toBe("idle");
+		expect(controller.handsFreeActive).toBe(false);
+		expect(options.showWarning).toHaveBeenCalledWith("xAI credentials unavailable");
+
+		// The failed latch must not leave the hold trigger locked out of the next start.
+		await controller.toggle(editor, { ...options, trigger: "hold" });
+		expect(options.showWarning).toHaveBeenCalledTimes(2);
 	});
 });

@@ -28,6 +28,11 @@ type FakeEditor = {
 	onToggleThinking?: () => void;
 	onExternalEditor?: () => void;
 	onRetry?: () => void;
+	onSpaceHoldStart?: () => void;
+	onSpaceHoldEnd?: () => void;
+	onSpaceTapToggle?: (taps: number) => void;
+	sttHoldEnabled?: () => boolean;
+	handsFreeActive?: () => boolean;
 	onChange?: (text: string) => void;
 	onSubmit?: (text: string) => Promise<void>;
 	setText(text: string): void;
@@ -71,6 +76,7 @@ async function createContext() {
 		"app.clipboard.pasteImage": ["ctrl+v"],
 		"app.tools.toggleVisibility": ["ctrl+shift+o"],
 		"app.tools.expand": ["ctrl+o"],
+		"app.stt.handsFree": ["ctrl+space"],
 	};
 	const customHandlers = new Map<string, () => void>();
 	const setActionKeys = vi.fn();
@@ -222,6 +228,8 @@ async function createContext() {
 		showUserMessageSelector: vi.fn(),
 		showSessionSelector: vi.fn(),
 		handleSTTToggle: vi.fn(),
+		handleSTTHandsFreeToggle: vi.fn(),
+		isSttHandsFreeActive: vi.fn(() => false),
 		showDebugSelector: vi.fn(),
 		showHistorySearch: vi.fn(),
 		toggleThinkingBlockVisibility: vi.fn(),
@@ -297,6 +305,43 @@ describe("InputController keybinding setup", () => {
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(1, { temporaryOnly: true });
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(2);
 		expect(spies.resetDisplayAfterAppearanceRefresh).toHaveBeenCalledTimes(1);
+	});
+
+	it("wires the hands-free key and space burst to the latched toggle", async () => {
+		const { InputController, ctx, editor, customHandlers } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		customHandlers.get("ctrl+space")?.();
+		expect(ctx.handleSTTHandsFreeToggle).toHaveBeenCalledTimes(1);
+
+		editor.onSpaceTapToggle?.(3);
+		expect(ctx.handleSTTHandsFreeToggle).toHaveBeenCalledTimes(2);
+
+		// Push-to-talk stays its own trigger, so its release can never stop a latched session.
+		editor.onSpaceHoldStart?.();
+		expect(ctx.handleSTTToggle).toHaveBeenCalledWith("hold");
+		editor.onSpaceHoldEnd?.();
+		expect(ctx.handleSTTToggle).toHaveBeenLastCalledWith("hold");
+
+		// The editor asks the app whether a latch owns the mic, so it can stand the hold gesture down.
+		expect(editor.handsFreeActive?.()).toBe(false);
+		(ctx.isSttHandsFreeActive as Mock<() => boolean>).mockReturnValue(true);
+		expect(editor.handsFreeActive?.()).toBe(true);
+	});
+
+	it("lets a user chord for app.stt.toggle outrank the hands-free default", async () => {
+		const { InputController, ctx, customHandlers, setKeybinding } = await createContext();
+		const controller = new InputController(ctx);
+		// The user bound the push-to-talk action to the very chord the latch ships by default.
+		setKeybinding("app.stt.toggle", ["ctrl+space"]);
+
+		controller.setupKeyHandlers();
+
+		customHandlers.get("ctrl+space")?.();
+		expect(ctx.handleSTTToggle).toHaveBeenCalledTimes(1);
+		expect(ctx.handleSTTHandsFreeToggle).not.toHaveBeenCalled();
 	});
 
 	it("registers the tool activity visibility action", async () => {

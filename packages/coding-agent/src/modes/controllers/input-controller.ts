@@ -568,6 +568,14 @@ export class InputController {
 		for (const key of this.ctx.keybindings.getKeys("app.stt.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleSTTToggle());
 		}
+		// A user chord for `app.stt.toggle` outranks the hands-free default below: `app.stt.toggle`
+		// ships unbound, so any key it reports here came from keybindings.yml, and silently replacing
+		// the user's own voice key with the latch (or vice versa) would be worse than neither firing.
+		const userToggleKeys = new Set(this.ctx.keybindings.getKeys("app.stt.toggle"));
+		for (const key of this.ctx.keybindings.getKeys("app.stt.handsFree")) {
+			if (userToggleKeys.has(key)) continue;
+			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleSTTHandsFreeToggle());
+		}
 		for (const key of this.ctx.keybindings.getKeys("app.live.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleLiveCommand());
 		}
@@ -575,8 +583,14 @@ export class InputController {
 		// the spam back out, and toggles STT on hold start / release. Gated on `stt.enabled` so a
 		// disabled STT leaves the space bar typing normally.
 		this.ctx.editor.sttHoldEnabled = () => settings.get("stt.enabled");
-		this.ctx.editor.onSpaceHoldStart = () => void this.ctx.handleSTTToggle();
-		this.ctx.editor.onSpaceHoldEnd = () => void this.ctx.handleSTTToggle();
+		this.ctx.editor.onSpaceHoldStart = () => void this.ctx.handleSTTToggle("hold");
+		this.ctx.editor.onSpaceHoldEnd = () => void this.ctx.handleSTTToggle("hold");
+		// Triple-tap the space bar to latch hands-free dictation: recording keeps running after the
+		// key is released, so the user can alt-tab away and keep talking. The same gesture (or the
+		// keybinding) stops it. `handsFreeActive` makes the editor stand down the hold gesture while
+		// the latch owns the mic.
+		this.ctx.editor.onSpaceTapToggle = () => void this.ctx.handleSTTHandsFreeToggle();
+		this.ctx.editor.handsFreeActive = () => this.ctx.isSttHandsFreeActive();
 		for (const key of this.ctx.keybindings.getKeys("app.clipboard.copyLine")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.handleCopyCurrentLine());
 		}

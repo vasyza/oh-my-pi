@@ -279,7 +279,7 @@ async function handleSpeechSetup(flags: { json?: boolean; check?: boolean }): Pr
 	console.log(chalk.green(`\n${theme.status.success} Speech is ready`));
 	console.log(
 		chalk.dim(
-			"Enable speech-to-text via stt.enabled, then hold Space to talk (or bind app.stt.toggle); enable the speech-generation tool via speechgen.enabled; speak replies aloud via speech.enabled.",
+			"Enable speech-to-text via stt.enabled, then hold Space to talk (push-to-talk), or press Ctrl+Space (Ctrl+Shift+Space where an IME owns that chord) / triple-tap Space for hands-free dictation; enable the speech-generation tool via speechgen.enabled; speak replies aloud via speech.enabled.",
 		),
 	);
 }

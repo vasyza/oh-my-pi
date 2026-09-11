@@ -141,6 +141,23 @@ export const SPACE_HOLD_MECHANICAL_RUN = 2;
 /** Idle gap (ms) after the last repeated space that counts as the space bar being released, ending
  *  the push-to-talk recording. Must comfortably exceed the OS key-repeat interval. */
 export const SPACE_HOLD_RELEASE_MS = 250;
+/** Longest gap (ms) between deliberate space taps that still counts as one latched-dictation
+ *  gesture. Well above {@link SPACE_REPEAT_MAX_GAP_MS} so auto-repeat never qualifies, and short
+ *  enough that ordinary typing ("word " then a fast next space) stays out: a 400 ms inter-word gap
+ *  is ~150 wpm, faster than sustained human typing. */
+export const SPACE_TAP_GAP_MS = 400;
+/** Deliberate taps in one gesture that latch hands-free dictation. Three, not two: consecutive
+ *  spaces never appear in ordinary prose except as the double-space-after-a-period habit, which
+ *  must keep typing two spaces. Taps past this count in the same burst are swallowed so the latch
+ *  cannot toggle straight back off. */
+export const SPACE_TAP_COUNT = 3;
+/** Steadiness ceiling (ms) that marks a cadence inside the tap band as a held bar rather than taps.
+ *  OS key-repeat stays metronomic even at slow rates (macOS `KeyRepeat`, Windows' slow repeat
+ *  settings, `xset r rate`), while a human tapping the bar varies by more than this. Deliberately
+ *  tight: a burst the user taps almost perfectly evenly is refused, which costs one retry, whereas
+ *  a held bar mistaken for taps would silently turn push-to-talk into a recording that outlives the
+ *  key. */
+export const SPACE_TAP_METRONOME_MS = 12;
 
 /** Whether two consecutive inter-space gaps look machine-driven: both within the auto-repeat band
  *  and steady enough (small absolute or proportional difference). OS key-repeat is metronomic, so
@@ -150,6 +167,15 @@ function gapsAreMechanical(gap: number, prevGap: number): boolean {
 	if (gap > SPACE_REPEAT_MAX_GAP_MS || prevGap > SPACE_REPEAT_MAX_GAP_MS) return false;
 	const tolerance = Math.max(SPACE_REPEAT_JITTER_MS, Math.min(gap, prevGap) * SPACE_REPEAT_JITTER_RATIO);
 	return Math.abs(gap - prevGap) <= tolerance;
+}
+
+/** Whether a cadence inside the tap band is a held bar's repeat rather than deliberate taps. Only
+ *  the absolute part of {@link gapsAreMechanical}'s test applies: at a 200-400 ms repeat rate the
+ *  proportional tolerance would swallow ordinary human variance, and the steady-vs-jittery
+ *  distinction has to stay tight enough to refuse metronomic bursts. */
+function gapsAreMetronomicInTapBand(gap: number, prevGap: number): boolean {
+	if (gap > SPACE_TAP_GAP_MS || prevGap > SPACE_TAP_GAP_MS) return false;
+	return Math.abs(gap - prevGap) <= SPACE_TAP_METRONOME_MS;
 }
 
 function isPastedPathSeparator(char: string | undefined): boolean {
@@ -766,9 +792,19 @@ export class CustomEditor extends Editor {
 	/** Fired when the held space bar is released (detected as an idle gap with no further repeated
 	 *  spaces) — the push-to-talk STT stop. */
 	onSpaceHoldEnd?: () => void;
-	/** Gate for the space-hold gesture. Returns false to keep the space bar inserting spaces
-	 *  normally; wired to `stt.enabled` so disabling STT restores plain space behavior. */
+	/** Fired when the space bar is tapped {@link SPACE_TAP_COUNT} times in one burst (deliberate
+	 *  taps, not a hold) — the latched hands-free STT toggle: recording survives the key release and
+	 *  continues while the user is focused elsewhere. Receives the burst's tap count. The tapped
+	 *  spaces are deleted before this runs. */
+	onSpaceTapToggle?: (taps: number) => void;
+	/** Gate for both space gestures (hold push-to-talk and the latched tap burst). Returns false to
+	 *  keep the space bar inserting spaces normally; wired to `stt.enabled` so disabling STT
+	 *  restores plain space behavior. */
 	sttHoldEnabled?: () => boolean;
+	/** True while a latched (hands-free) recording owns the microphone: the hold gesture then steps
+	 *  aside so a stray hold cannot cut the dictation off mid-sentence. The tap gesture stays live —
+	 *  it is how the same latch is turned back off. */
+	handsFreeActive?: () => boolean;
 
 	/** Custom key handlers from extensions and non-built-in app actions. */
 	#customKeyHandlers = new Map<KeyId, () => void>();
@@ -790,6 +826,16 @@ export class CustomEditor extends Editor {
 	#spaceRunInserted = 0;
 	/** Consecutive "mechanical" deltas (fast + steady); a sustained run of these confirms a held bar. */
 	#mechanicalRun = 0;
+	/** Deliberate-tap burst state for the latched gesture: taps seen in the current burst, reset by
+	 *  any non-space key or by a gap past {@link SPACE_TAP_GAP_MS}. Past {@link SPACE_TAP_COUNT} the
+	 *  burst's remaining taps are swallowed. */
+	#spaceTapBurst = 0;
+	/** Spaces the current tap burst typed, rolled back when the burst latches. Kept apart from
+	 *  {@link #spaceRunInserted} so a burst never removes spaces it did not type itself. */
+	#spaceTapInserted = 0;
+	/** Composer length right after the burst's last typed space (0 = unknown). A different length
+	 *  before the next tap means another writer landed in between, so only that tap is rolled back. */
+	#spaceTapLength = 0;
 	/** Inter-space gap (ms) of the previous space pair, compared against the next to judge steadiness. */
 	#prevSpaceGap: number | undefined;
 	/** Monotonic timestamp (ms) of the last space, to measure the gap to the next one. */
@@ -864,18 +910,41 @@ export class CustomEditor extends Editor {
 
 	#spaceHoldGestureEnabled(): boolean {
 		// Push-to-talk is a text-composition gesture, so it stays out of Vim's Normal/Visual modes
-		// where the space bar is the `l` motion.
-		if (this.vimMode !== "insert") return false;
+		// where the space bar is the `l` motion. A latched hands-free session also disables it: the
+		// mic belongs to that session and a stray hold must not cut it off mid-sentence.
+		if (this.vimMode !== "insert" || (this.handsFreeActive?.() ?? false)) return false;
 		return this.onSpaceHoldStart !== undefined && (this.sttHoldEnabled?.() ?? false) && !this.isShowingAutocomplete();
 	}
 
-	/** Drive the space-hold push-to-talk state machine. Returns true when the gesture consumed the
-	 *  input so it must not reach normal editing. A held space bar emits OS auto-repeat: a *steady*
-	 *  stream of spaces at a fixed fast interval. We watch the inter-space deltas and only recognize a
-	 *  hold once {@link SPACE_HOLD_MECHANICAL_RUN} consecutive deltas are "mechanical" — both
-	 *  auto-repeat-fast and near-identical (see {@link gapsAreMechanical}). Smashing the bar is fast
-	 *  but jittery and deliberate taps are too slow, so neither escalates and both keep typing real
-	 *  spaces; the few spaces typed before a real hold is recognized are tracked back out. */
+	/** The tap gesture stays available while a latch is active — that is how the user stops it
+	 *  without a keyboard round trip — even if `stt.enabled` was turned off mid-recording: the
+	 *  microphone is already open, and ending that session has to stay possible. */
+	#spaceTapGestureEnabled(): boolean {
+		if (this.vimMode !== "insert" || this.isShowingAutocomplete()) return false;
+		return (
+			this.onSpaceTapToggle !== undefined &&
+			((this.sttHoldEnabled?.() ?? false) || (this.handsFreeActive?.() ?? false))
+		);
+	}
+
+	/** Drive the space-bar STT gestures. Returns true when the input was consumed and must not
+	 *  reach normal editing. Two gestures share the bar:
+	 *
+	 *  - **Hold (push-to-talk).** A held space bar emits OS auto-repeat: a *steady* stream of
+	 *    spaces at a fixed fast interval. We watch the inter-space deltas and only recognize a hold
+	 *    once {@link SPACE_HOLD_MECHANICAL_RUN} consecutive deltas are "mechanical" — both
+	 *    auto-repeat-fast and near-identical (see {@link gapsAreMechanical}). Smashing the bar is
+	 *    fast but jittery and deliberate taps are too slow, so neither escalates and both keep
+	 *    typing real spaces; the few spaces typed before a real hold is recognized are tracked back
+	 *    out.
+	 *  - **Tap burst (latched hands-free).** {@link SPACE_TAP_COUNT} deliberate taps within
+	 *    {@link SPACE_TAP_GAP_MS} latch STT on; the recording then survives the key release and
+	 *    keeps running while the user is focused elsewhere. A tap is deliberately *not* an
+	 *    auto-repeat (gap ≥ {@link SPACE_REPEAT_MAX_GAP_MS}), so a held bar can never count as taps,
+	 *    and taps past the count are swallowed so the latch cannot toggle straight back off.
+	 *
+	 *  Taps are recognized before the hold branch, so a fast burst latches instead of feeding the
+	 *  mechanical counter; while a hold is active the tap counter stays quiet. */
 	#handleSpaceHold(data: string, canonical: string | undefined): boolean {
 		const isSpace = canonical === "space";
 		if (this.#spaceHoldActive) {
@@ -889,15 +958,26 @@ export class CustomEditor extends Editor {
 			return false;
 		}
 		if (!isSpace) {
+			// A non-space ends both gesture chains: the hold's steadiness run and the tap burst.
 			this.#resetSpaceRun();
 			return false;
 		}
-		if (!this.#spaceHoldGestureEnabled()) return false;
 		const now = performance.now();
 		const gap = now - this.#lastSpaceAt;
 		const prevGap = this.#prevSpaceGap;
 		this.#lastSpaceAt = now;
 		this.#prevSpaceGap = gap;
+		if (this.#spaceTapGestureEnabled() && this.#handleSpaceTap(data, gap, prevGap)) return true;
+		// A space the tap branch did not consume is not a tap: any burst a previous space started was
+		// a false start (this is machine cadence, or the tap gesture is off), so drop it with its count
+		// — otherwise a latch later rolls back spaces that belong to this run.
+		this.#spaceTapBurst = 0;
+		this.#spaceTapInserted = 0;
+		this.#spaceTapLength = 0;
+		// Neither gesture applies (latch owns the mic, autocomplete is showing, Vim normal mode, or
+		// push-to-talk is disabled): let the base handler type the space and keep its `->` expansion
+		// and other input post-processing intact.
+		if (!this.#spaceHoldGestureEnabled()) return false;
 		if (prevGap === undefined || !gapsAreMechanical(gap, prevGap)) {
 			// First space, a deliberate tap, or jittery smashing: not a steady machine cadence yet, so
 			// type a real space and reset the mechanical run.
@@ -916,11 +996,74 @@ export class CustomEditor extends Editor {
 		return true;
 	}
 
+	/** Track deliberate taps of the space bar for the latched hands-free gesture. Returns true when
+	 *  the tap was consumed (it was typed as part of a burst, or rolled back when the burst reached
+	 *  {@link SPACE_TAP_COUNT} and latched). Each tap types its own space — the hold branch never
+	 *  sees one, so `handsFreeActive` disabling the hold cannot drop a typed space. */
+	#handleSpaceTap(data: string, gap: number, prevGap: number | undefined): boolean {
+		if (this.onSpaceTapToggle === undefined) return false;
+		// A machine-driven gap is auto-repeat, never a tap; it must keep feeding the hold detector.
+		if (gap < SPACE_REPEAT_MAX_GAP_MS) return false;
+		// A steady cadence inside the tap band is a *slow* held bar, not taps: OS key-repeat stays
+		// metronomic at any rate, so those spaces must keep typing (and feeding the hold detector)
+		// instead of latching a session that would outlive the key.
+		if (prevGap !== undefined && gapsAreMetronomicInTapBand(gap, prevGap)) return false;
+		// A gap past the window ends the previous burst.
+		if (gap > SPACE_TAP_GAP_MS) {
+			this.#spaceTapBurst = 0;
+			this.#spaceTapInserted = 0;
+			this.#spaceTapLength = 0;
+		}
+		// A deliberate tap is by definition not part of a held-bar cadence.
+		this.#mechanicalRun = 0;
+		this.#spaceTapBurst++;
+		if (this.#spaceTapBurst > SPACE_TAP_COUNT) return true;
+		const lengthBefore = this.getText().length;
+		if (this.#spaceTapLength !== 0 && lengthBefore !== this.#spaceTapLength) {
+			this.#spaceTapInserted = 0;
+			this.#spaceTapLength = 0;
+		}
+		super.handleInput(data);
+		this.#spaceRunInserted++;
+		this.#spaceTapInserted++;
+		if (this.#spaceTapBurst === SPACE_TAP_COUNT) {
+			// Roll back only this burst's own spaces, and only those still sitting right before the
+			// cursor: a paste or extension insert between the taps must never be eaten, and the
+			// pre-burst spaces in the run belong to the hold gesture's own roll-back, not here.
+			// Another writer between the taps (a paste, a chip) makes the earlier burst spaces
+			// unreachable by position, so only the tap just typed is safe to take back.
+			const contiguous = this.#spaceTapLength !== 0 && lengthBefore === this.#spaceTapLength;
+			const own = contiguous ? this.#spaceTapInserted : 1;
+			const removable = Math.min(own, this.#trailingSpaceRun());
+			if (removable > 0) this.deleteBeforeCursor(removable);
+			this.#spaceRunInserted = Math.max(0, this.#spaceRunInserted - removable);
+			this.#spaceTapInserted = 0;
+			this.#spaceTapLength = 0;
+			this.onSpaceTapToggle(SPACE_TAP_COUNT);
+			return true;
+		}
+		this.#spaceTapLength = lengthBefore + 1;
+		return true;
+	}
+
+	/** Spaces directly before the cursor: the only characters a gesture roll-back may delete, so an
+	 *  interleaved paste or chip never loses text it did not type. */
+	#trailingSpaceRun(): number {
+		const { line, col } = this.getCursor();
+		const currentLine = this.getLines()[line] ?? "";
+		let count = 0;
+		while (count < col && currentLine[col - 1 - count] === " ") count++;
+		return count;
+	}
+
 	#resetSpaceRun(): void {
 		this.#spaceRunInserted = 0;
 		this.#mechanicalRun = 0;
 		this.#prevSpaceGap = undefined;
 		this.#lastSpaceAt = Number.NEGATIVE_INFINITY;
+		this.#spaceTapBurst = 0;
+		this.#spaceTapInserted = 0;
+		this.#spaceTapLength = 0;
 	}
 
 	#beginSpaceHold(): void {

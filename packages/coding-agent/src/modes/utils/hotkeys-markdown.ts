@@ -56,6 +56,7 @@ export function buildHotkeysMarkdown(bindings: HotkeysMarkdownBindings): string 
 		`| \`${appKey(bindings, "app.retry")}\` | Retry last failed assistant turn |`,
 		`| \`${appKey(bindings, "app.clipboard.pasteImage")}\` | Paste image or text from clipboard |`,
 		"| Hold `Space` | Speech-to-text (push-to-talk): hold to record, release to transcribe |",
+		`| \`${appKey(bindings, "app.stt.handsFree")}\` / triple-tap \`Space\` | Toggle hands-free dictation: keeps recording after the key is released |`,
 		`| \`${appKey(bindings, "app.live.toggle")}\` | Start/stop live voice mode (/live) |`,
 		`| \`${appKey(bindings, "app.agents.hub")}\` / \`${appKey(bindings, "app.session.observe")}\` / double-tap \`←\` (empty editor) | Open the agent hub |`,
 		"| `#<number>` | GitHub issue/PR reference (e.g. `#3164` → `pr://`/`issue://`) |",
